@@ -1,7 +1,6 @@
 # 🚀 Deploy OWASP Juice Shop on OpenStack using Terraform and Ansible
 
-This project demonstrates an **end-to-end deployment pipeline** for running **OWASP Juice Shop** on **OpenStack** using:
-By Ori
+This project demonstrates an **end-to-end deployment pipeline** for running **OWASP Juice Shop** on **OpenStack** 
 - **Terraform** – provision OpenStack infrastructure  
 - **Ansible** – configure gateway, edges, registry, proxy, and app runtime  
 - **Kolla-Ansible** – deploy and manage OpenStack services  
