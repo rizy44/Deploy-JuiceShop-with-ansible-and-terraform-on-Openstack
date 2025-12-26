@@ -1,0 +1,23 @@
+global
+  log /dev/log local0
+  maxconn 2048
+
+defaults
+  log global
+  mode http
+  option httplog
+  timeout connect 5s
+  timeout client  30s
+  timeout server  30s
+
+frontend fe_http
+  bind *:{{ lb_port }}
+  default_backend be_edges
+
+backend be_edges
+  balance roundrobin
+  option httpchk GET /
+  http-check expect status 200,302
+{% for host in groups['edges'] %}
+  server {{ host }} {{ hostvars[host]['ansible_host'] }}:{{ edge_app_port }} check
+{% endfor %}

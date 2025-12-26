@@ -1,0 +1,109 @@
+---
+- name: Configure edges (APT via gateway proxy, install docker.io, pull from registry, run Juice Shop)
+  hosts: edges
+  become: true
+
+  vars:
+    gateway_private_ip_val: "{{ gateway_private_ip }}"
+    registry_port_int: "{{ registry_port | int }}"
+    edge_app_port_int: "{{ edge_app_port | int }}"
+    image_local: "{{ gateway_private_ip_val }}:{{ registry_port_int }}/juice-shop:latest"
+
+    apt_proxy_port: 3142
+
+  tasks:
+    - name: Wait for gateway apt proxy port
+      ansible.builtin.wait_for:
+        host: "{{ gateway_private_ip_val }}"
+        port: "{{ apt_proxy_port }}"
+        timeout: 20
+
+    - name: Configure apt to use gateway as proxy (http + https)
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/01proxy
+        mode: "0644"
+        content: |
+          Acquire::http::Proxy "http://{{ gateway_private_ip_val }}:{{ apt_proxy_port }}/";
+          Acquire::https::Proxy "http://{{ gateway_private_ip_val }}:{{ apt_proxy_port }}/";
+          Acquire::http::Pipeline-Depth "0";
+
+    - name: Force apt IPv4 (avoid IPv6 hang)
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99force-ipv4
+        mode: "0644"
+        content: |
+          Acquire::ForceIPv4 "true";
+
+    - name: Apt update (via gateway proxy)
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install Docker from Ubuntu repo (docker.io) + prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - docker.io
+        state: present
+
+    - name: Ensure docker running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Configure Docker to allow private registry (HTTP insecure)
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+        content: |
+          {
+            "insecure-registries": ["{{ gateway_private_ip_val }}:{{ registry_port_int }}"]
+          }
+      notify: Restart docker
+
+    - name: Apply docker daemon changes now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for gateway registry port
+      ansible.builtin.wait_for:
+        host: "{{ gateway_private_ip_val }}"
+        port: "{{ registry_port_int }}"
+        timeout: 20
+
+    - name: Pull image from gateway registry
+      ansible.builtin.command: docker pull {{ image_local }}
+      register: pull_result
+      changed_when: "'Downloaded newer image' in pull_result.stdout or 'Status: Downloaded newer image' in pull_result.stdout"
+
+    - name: Remove old container if exists
+      ansible.builtin.shell: |
+        set -e
+        if docker ps -a --format '{{"{{"}}.Names{{"}}"}}' | grep -qx juice-shop; then
+          docker rm -f juice-shop
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Run Juice Shop on edge port {{ edge_app_port_int }} -> container 3000
+      ansible.builtin.command: >
+        docker run -d --name juice-shop
+        -p {{ edge_app_port_int }}:3000
+        --restart unless-stopped
+        {{ image_local }}
+      changed_when: true
+
+    - name: Wait for app port on edge
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ edge_app_port_int }}"
+        delay: 2
+        timeout: 120
+
+  handlers:
+    - name: Restart docker
+      ansible.builtin.service:
+        name: docker
+        state: restarted

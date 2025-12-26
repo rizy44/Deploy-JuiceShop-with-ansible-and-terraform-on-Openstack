@@ -1,0 +1,196 @@
+---
+- name: Configure gateway (apt-cacher-ng + docker registry + haproxy)
+  hosts: gateway
+  become: true
+
+  vars:
+    # Inventory vars (from inventory.ini)
+    gateway_private_ip_val: "{{ gateway_private_ip }}"
+    registry_port_int: "{{ registry_port | int }}"
+    lb_port_int: "{{ lb_port | int }}"
+
+    # Upstream/local image
+    image_upstream: "bkimminich/juice-shop:latest"
+    image_local: "{{ gateway_private_ip_val }}:{{ registry_port_int }}/juice-shop:latest"
+
+    # apt-cacher-ng
+    apt_proxy_port: 3142
+    # IMPORTANT: apt-cacher-ng versions often DON'T accept CIDR like 10.10.20.0/24
+    # Use wildcard or regex instead:
+    edge_allowed_hosts: "10.10.20.*"
+    # edge_allowed_hosts: "^10\\.10\\.20\\..*"
+
+  pre_tasks:
+    - name: Show routing decision for 8.8.8.8 (debug)
+      ansible.builtin.command: ip route get 8.8.8.8
+      register: route_dbg
+      changed_when: false
+      failed_when: false
+
+    - name: Fail fast if no route to internet (likely wrong default route)
+      ansible.builtin.fail:
+        msg: >
+          Gateway egress looks wrong / no internet. 'ip route get 8.8.8.8' => {{ route_dbg.stdout | default(route_dbg.stderr, true) }}.
+          Fix default route on gateway (DMZ NIC should be default) then re-run.
+      when: route_dbg.rc != 0
+
+  tasks:
+    # -------------------------
+    # Base packages
+    # -------------------------
+    - name: Apt update
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install dependencies (haproxy + apt-cacher-ng + docker prereqs)
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - haproxy
+          - apt-cacher-ng
+        state: present
+
+    # -------------------------
+    # Docker install + daemon config
+    # -------------------------
+    - name: Install Docker on gateway if missing (get.docker.com)
+      ansible.builtin.shell: |
+        set -e
+        if ! command -v docker >/dev/null 2>&1; then
+          curl -fsSL https://get.docker.com | sh
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Ensure docker running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Configure Docker daemon for insecure registry (HTTP)
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+        content: |
+          {
+            "insecure-registries": ["{{ gateway_private_ip_val }}:{{ registry_port_int }}"]
+          }
+      notify: Restart docker
+
+    - name: Apply docker daemon changes now
+      ansible.builtin.meta: flush_handlers
+
+    # -------------------------
+    # apt-cacher-ng config
+    # -------------------------
+    - name: Configure apt-cacher-ng bind address
+      ansible.builtin.lineinfile:
+        path: /etc/apt-cacher-ng/acng.conf
+        regexp: '^#?BindAddress:'
+        line: 'BindAddress: 0.0.0.0'
+        backup: true
+      notify: Restart apt-cacher-ng
+
+
+    - name: Ensure apt-cacher-ng allows HTTPS passthrough
+      ansible.builtin.lineinfile:
+        path: /etc/apt-cacher-ng/acng.conf
+        regexp: '^#?PassThroughPattern:'
+        line: 'PassThroughPattern: .*'
+        backup: true
+      notify: Restart apt-cacher-ng
+
+    - name: Validate apt-cacher-ng config (parse check)
+      ansible.builtin.command: apt-cacher-ng -c /etc/apt-cacher-ng -v
+      register: acng_check
+      changed_when: false
+
+    - name: Ensure apt-cacher-ng running
+      ansible.builtin.service:
+        name: apt-cacher-ng
+        state: started
+        enabled: true
+
+    - name: Apply apt-cacher-ng config now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for apt-cacher-ng port (on gateway private IP)
+      ansible.builtin.wait_for:
+        host: "{{ gateway_private_ip_val }}"
+        port: "{{ apt_proxy_port }}"
+        timeout: 30
+
+    # -------------------------
+    # Private registry + image
+    # -------------------------
+    - name: Ensure private registry container running (bind ONLY private IP)
+      ansible.builtin.shell: |
+        set -e
+        if docker ps -a --format '{{"{{"}}.Names{{"}}"}}' | grep -qx registry; then
+          docker rm -f registry
+        fi
+        docker run -d --restart unless-stopped \
+          --name registry \
+          -p {{ gateway_private_ip_val }}:{{ registry_port_int }}:5000 \
+          registry:2
+      args:
+        executable: /bin/bash
+
+    - name: Wait for registry port on private IP
+      ansible.builtin.wait_for:
+        host: "{{ gateway_private_ip_val }}"
+        port: "{{ registry_port_int }}"
+        timeout: 30
+
+    - name: Pull upstream Juice Shop on gateway
+      ansible.builtin.command: docker pull {{ image_upstream }}
+      register: pull_up
+      changed_when: "'Downloaded newer image' in pull_up.stdout or 'Downloaded newer image' in pull_up.stderr"
+
+    - name: Tag image for private registry
+      ansible.builtin.command: docker tag {{ image_upstream }} {{ image_local }}
+      changed_when: true
+
+    - name: Push image into private registry
+      ansible.builtin.command: docker push {{ image_local }}
+      register: push_out
+      changed_when: "'pushed' in push_out.stdout or 'pushed' in push_out.stderr"
+
+    # -------------------------
+    # HAProxy
+    # -------------------------
+    - name: Deploy HAProxy config
+      ansible.builtin.template:
+        src: ../templates/haproxy.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+        mode: "0644"
+      notify: Restart haproxy
+
+    - name: Ensure haproxy running
+      ansible.builtin.service:
+        name: haproxy
+        state: started
+        enabled: true
+
+    - name: Apply haproxy restart now (if needed)
+      ansible.builtin.meta: flush_handlers
+
+  handlers:
+    - name: Restart docker
+      ansible.builtin.service:
+        name: docker
+        state: restarted
+
+    - name: Restart haproxy
+      ansible.builtin.service:
+        name: haproxy
+        state: restarted
+
+    - name: Restart apt-cacher-ng
+      ansible.builtin.service:
+        name: apt-cacher-ng
+        state: restarted

@@ -1,0 +1,117 @@
+---
+- name: Gateway - Host private Ubuntu repo (apt-mirror + nginx)
+  hosts: gateway
+  become: true
+
+  vars:
+    gateway_private_ip_val: "{{ gateway_private_ip }}"
+    ubuntu_codename: "jammy"
+    mirror_base: "/var/spool/apt-mirror"
+    mirror_upstream: "http://archive.ubuntu.com/ubuntu"
+    mirror_url_path: "/ubuntu/"
+    mirror_local_root: "{{ mirror_base }}/mirror/archive.ubuntu.com/ubuntu"
+
+    # Repo components (bạn có thể giảm bớt nếu thiếu disk)
+    ubuntu_components: "main restricted universe multiverse"
+
+  tasks:
+    - name: Apt update (gateway)
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install apt-mirror + nginx
+      ansible.builtin.apt:
+        name:
+          - apt-mirror
+          - nginx
+        state: present
+
+    - name: Ensure base directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ mirror_base }}"
+        - "{{ mirror_local_root }}"
+
+    - name: Configure apt-mirror list (Ubuntu {{ ubuntu_codename }})
+      ansible.builtin.copy:
+        dest: /etc/apt/mirror.list
+        mode: "0644"
+        content: |
+          set base_path    {{ mirror_base }}
+          set nthreads     10
+          set _tilde       0
+
+          deb {{ mirror_upstream }} {{ ubuntu_codename }} {{ ubuntu_components }}
+          deb {{ mirror_upstream }} {{ ubuntu_codename }}-updates {{ ubuntu_components }}
+          deb {{ mirror_upstream }} {{ ubuntu_codename }}-security {{ ubuntu_components }}
+
+          clean {{ mirror_upstream }}
+
+    # Lần đầu sync sẽ lâu. Bạn có thể chạy tag này riêng:
+    # ansible-playbook ... gateway_repo.yml --tags mirror
+    - name: Run apt-mirror (sync repo) - first run may take a while
+      ansible.builtin.command: apt-mirror
+      args:
+        chdir: "{{ mirror_base }}"
+      tags: ["mirror"]
+
+    - name: Configure nginx site for local Ubuntu mirror
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/ubuntu-mirror
+        mode: "0644"
+        content: |
+          server {
+            listen 80;
+            server_name _;
+            autoindex on;
+
+            location {{ mirror_url_path }} {
+              alias {{ mirror_local_root }}/;
+            }
+          }
+      notify: Restart nginx
+
+    - name: Enable ubuntu-mirror site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/ubuntu-mirror
+        dest: /etc/nginx/sites-enabled/ubuntu-mirror
+        state: link
+      notify: Restart nginx
+
+    - name: Disable default nginx site (optional)
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Restart nginx
+
+    - name: Ensure nginx running
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Apply nginx config now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for nginx port 80 on gateway private IP
+      ansible.builtin.wait_for:
+        host: "{{ gateway_private_ip_val }}"
+        port: 80
+        timeout: 30
+
+    - name: Check repo Release file from gateway private IP
+      ansible.builtin.uri:
+        url: "http://{{ gateway_private_ip_val }}{{ mirror_url_path }}dists/{{ ubuntu_codename }}/Release"
+        status_code: 200
+      register: repo_check
+      changed_when: false
+
+  handlers:
+    - name: Restart nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
