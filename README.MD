@@ -1,4 +1,4 @@
-# 🚀 Deploy OWASP Juice Shop on OpenStack using Terraform and Ansible
+#  Deploy OWASP Juice Shop on OpenStack using Terraform and Ansible
 
 This project demonstrates an **end-to-end deployment pipeline** for running **OWASP Juice Shop** on **OpenStack** 
 - **Terraform** – provision OpenStack infrastructure  
@@ -63,7 +63,7 @@ rm -rf .terraform .terraform.lock.hcl
 
 After run, terraform will generate inventory,ini for ansible to run task.
 
-### 🧪 Inventory Validation & Debugging
+###  Inventory Validation & Debugging
 ```bash
 ansible-inventory -i /etc/kolla/ansible/inventory/tenantA-inventory --list
 ansible -i /etc/kolla/ansible/inventory/tenantA-inventory -m ping all
